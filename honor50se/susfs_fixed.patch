@@ -1,17 +1,62 @@
+# =============================================================================
+# 荣耀 50 SE (JLH-AN00) SUSFS Fixed 补丁
+# =============================================================================
+# 【文件用途】
+# 修复 SUSFS 通用补丁（susfs_patch_to_4.14.patch）在华为 4.14 内核上
+# 应用失败的 hunks。本补丁只包含真正失败的 hunks，避免被 patch 工具
+# 误判为 "reversed" 而跳过。
+#
+# 【为什么需要】
+# SUSFS 通用补丁基于标准 Linux 4.14 内核编写，但华为内核有大量魔改：
+#   1. fs/notify/fdinfo.c 的 inotify_fdinfo 函数签名和上下文与标准不同
+#   2. fs/proc/task_mmu.c 的头文件包含顺序与标准不同
+# 通用补丁的 context 行匹配不上，导致 hunk FAILED。
+#
+# 【修复点说明】
+# Hunk 1 (fdinfo.c): 恢复 inotify 隐藏功能
+#   - 问题 1: 通用补丁期望的 inotify_fdinfo 上下文与华为内核不同 → 重新写 hunk
+#   - 问题 2: 通用补丁用了 inotify_mark_user_mask(mark) 函数，但华为内核没有
+#             这个函数 → 用 (mark->mask & IN_ALL_EVENTS) 替代
+#   - 问题 3: 通用补丁在 orig_flow: 标签后直接跟变量声明 u32 mask = ...;
+#             但 Linux 4.14 默认用 gnu89 标准，标签后必须是语句，不能是声明
+#             → 在 orig_flow: 后加空语句 ; 解决
+#   - 问题 4: 通用补丁的 seq_printf 用 mark->ignored_mask，但 SUSFS 期望
+#             隐藏后显示 ignored_mask:0 → 改成字面量 0
+#
+# Hunk 2 (task_mmu.c): 添加 susfs_def.h 头文件
+#   - 问题: SUSFS 通用补丁在 task_mmu.c 用了 susfs_def.h 里的函数/宏，
+#           但没有包含这个头文件 → 补上 #include
+#
+# 【换机型说明】
+#   - 这是荣耀 50 SE 专属补丁，其他机型（4.19+）通常不需要
+#   - 如果换机型，需要根据新机型通用补丁的 .rej 文件重新生成
+#   - 注意 hunk header 的行数必须精确计算，否则会 "malformed patch"
+#
+# 【验证记录】
+#   - 2026-09-28: GitHub Actions CI 编译通过，fdinfo.o 和 task_mmu.o 无错误
+#   - inotify 隐藏功能已成功集成
+# =============================================================================
+
 diff --git a/fs/notify/fdinfo.c b/fs/notify/fdinfo.c
 --- a/fs/notify/fdinfo.c
 +++ b/fs/notify/fdinfo.c
-@@ -106,16 +106,71 @@ static void inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
+@@ -106,16 +106,86 @@ static void inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
  	inode_mark = container_of(mark, struct inotify_inode_mark, fsn_mark);
  	inode = igrab(mark->connector->inode);
  	if (inode) {
 +#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++		/* SUSFS sus_kstat 隐藏：如果当前是 app uid 且 inode 被 SUSFS 标记为
++		 * sus_kstat（伪造的 inode 信息），就用伪造的 ino/dev 替换真实的，
++		 * 防止 app 通过 /proc/pid/fdinfo/ 反查到真实的文件 inode。
++		 * 替代了通用补丁的 inotify_mark_user_mask(mark)（华为内核无此函数），
++		 * 改用 (mark->mask & IN_ALL_EVENTS) 直接计算掩码。 */
 +		if (susfs_is_current_app_uid()) {
 +			bool is_fuse = false;
 +			if (susfs_is_inode_sus_kstat(inode, &is_fuse)) {
 +				unsigned long ino = inode->i_ino;
 +				dev_t dev = inode->i_sb->s_dev;
 +				susfs_sus_kstat_spoof_inotify_fdinfo(&ino, &dev);
++				/* ignored_mask 显示为 0（隐藏真实值，匹配 SUSFS 期望） */
 +				seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
 +						inode_mark->wd, ino, dev,
 +						(mark->mask & IN_ALL_EVENTS));
@@ -23,6 +68,10 @@ diff --git a/fs/notify/fdinfo.c b/fs/notify/fdinfo.c
 +		}
 +#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 +#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++		/* SUSFS sus_mount 隐藏：如果当前进程被 SUSFS 标记为 umounted
++		 * （即该进程看不到某些挂载点），就通过 d_path 反查真实路径，
++		 * 用真实路径的 inode 信息替换当前 mount 的，防止 fdinfo 泄露。
++		 * 注意: 用 goto orig_flow 跳转到原逻辑，避免代码重复。 */
 +		if (likely(susfs_is_current_proc_umounted())) {
 +			struct mount *mnt = real_mount(file->f_path.mnt);
 +			if (mnt->mnt_id >= DEFAULT_KSU_MNT_ID) {
@@ -58,7 +107,10 @@ diff --git a/fs/notify/fdinfo.c b/fs/notify/fdinfo.c
 +			}
 +		}
 +orig_flow:
-+		; /* empty statement for gnu89 compat: label must be followed by a statement */
++		; /* ⚠️ gnu89 兼容性修复：标签后必须是语句，不能直接跟变量声明。
++		     空语句 ; 让标签有落脚点，后续的 u32 mask = ...; 才能编译通过。
++		     这是本补丁最关键的修复点，没有这个分号会报:
++		     error: expected expression (标签后期望语句) */
 +#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
  		/*
  		 * IN_ALL_EVENTS represents all of the mask bits
@@ -70,6 +122,8 @@ diff --git a/fs/notify/fdinfo.c b/fs/notify/fdinfo.c
 -		seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",
 -			   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,
 -			   mask, mark->ignored_mask);
++		/* 把 ignored_mask 从 mark->ignored_mask 改成字面量 0，
++		 * 匹配 SUSFS 隐藏后不显示真实 ignored_mask 的预期。 */
 +		seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
 +			   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,
 +			   mask);
@@ -79,11 +133,14 @@ diff --git a/fs/notify/fdinfo.c b/fs/notify/fdinfo.c
 diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
-@@ -22,6 +22,10 @@
+@@ -22,6 +22,13 @@
  #include <linux/uaccess.h>
  #include <linux/mm_inline.h>
  
 +#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
++/* SUSFS 头文件：包含 sus_kstat/sus_map/open_redirect 相关的函数声明和宏。
++ * 通用补丁在 task_mmu.c 里用了这些符号但没 include，导致编译时
++ * "implicit declaration of function" 错误，这里补上。 */
 +#include <linux/susfs_def.h>
 +#endif // #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
 +
